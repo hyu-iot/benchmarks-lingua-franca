@@ -46,9 +46,11 @@ reactor Manager(numWorkers: usize(20), dataLength: usize(1024)) {
 
     state A: Arc<Matrix<f64>>;
     state B: Arc<TransposedMatrix<f64>>;
-    state C: Arc<Mutex<Matrix<f64>>>;
+    state C: Matrix<f64>;
 
     state workQueue: VecDeque<WorkItem>;
+    state work_counter: u32;
+    state work_received_counter: u32;
 
     logical action next;
     logical action done;
@@ -56,9 +58,10 @@ reactor Manager(numWorkers: usize(20), dataLength: usize(1024)) {
     input start: unit;
     output finished: unit;
 
-    output data: {=(Arc<Matrix<f64>>, Arc<TransposedMatrix<f64>>, Arc<Mutex<Matrix<f64>>>)=};
-    output[numWorkers] doWork: WorkItem;
+    output data: {=(Arc<Matrix<f64>>, Arc<TransposedMatrix<f64>>)=};
+    output[numWorkers] doWork: {=WorkItem=};
     input[numWorkers] moreWork: {=[WorkItem; 8]=};
+    input[numWorkers] receiveWork: {=Vec<((usize, usize), f64)>=};
 
     reaction(startup) {=
         // Fill both input arrays with data
@@ -82,11 +85,13 @@ reactor Manager(numWorkers: usize(20), dataLength: usize(1024)) {
 
     reaction(start) -> data, next {=
         // reset the result matrix C
-        let c = Matrix::<f64>::new(self.data_length, self.data_length);
-        self.C = Arc::new(Mutex::new(c));
+        self.C = Matrix::<f64>::new(self.data_length, self.data_length);
 
-        // send pointers to all 3 matrixes to the workers
-        ctx.set(data, (Arc::clone(&self.A), Arc::clone(&self.B), Arc::clone(&self.C)));
+        // send pointers of A and B to the workers
+        ctx.set(data, (Arc::clone(&self.A), Arc::clone(&self.B)));
+
+        self.work_counter = 0;
+        self.work_received_counter = 0;
 
         // produce the first work item, instructing the worker to multiply the complete matrix
         let numBlocks = self.data_length * self.data_length;
@@ -97,13 +102,15 @@ reactor Manager(numWorkers: usize(20), dataLength: usize(1024)) {
     =}
 
     reaction(next) -> next, done, doWork {=
-        if self.workQueue.is_empty() {
+        info!("counter: {}, rec counter: {}", self.work_counter, self.work_received_counter);
+        if self.workQueue.is_empty() && self.work_counter == self.work_received_counter {
             // we are done if there is no more work
             ctx.schedule(done, Asap);
         } else {
             // send a work item to each worker (until there is no more work)
             for do_work in doWork {
                 if let Some(work_item) = self.workQueue.pop_front() {
+                    self.work_counter += 1;
                     ctx.set(do_work, work_item);
                 }
             }
@@ -116,16 +123,25 @@ reactor Manager(numWorkers: usize(20), dataLength: usize(1024)) {
         // append all work items received from the workers to the internal work queue
         for port in moreWork {
             if let Some(items) = ctx.get(&port) {
-                if !items.is_empty() {
-                    items.iter().for_each(|i| self.workQueue.push_back(*i));
-                }
+                items.iter().for_each(|i| self.workQueue.push_back(*i));
+                self.work_received_counter += 1;
             }
         }
     =}
 
+    reaction(receiveWork) {=
+        receiveWork.into_iter().for_each(|port| {
+            ctx.use_ref_opt(&port, |vec| {
+                self.work_received_counter += 1;
+                for ((i, j), v) in vec {
+                    self.C.set(*i, *j, self.C.get(*i, *j) + *v);
+                }
+            });
+        });
+    =}
+
     reaction(done) -> finished {=
-        let c = self.C.lock().unwrap();
-        let valid = is_valid(&c, self.data_length);
+        let valid = is_valid(&self.C, self.data_length);
         info!("Result valid = {}", valid);
         ctx.set(finished, ());
     =}
@@ -168,11 +184,11 @@ reactor Worker(threshold: usize(16384)) {
 
     state A: Arc<Matrix<f64>>;
     state B: Arc<TransposedMatrix<f64>>;
-    state C: Arc<Mutex<Matrix<f64>>>;
 
-    input data: {=(Arc<Matrix<f64>>, Arc<TransposedMatrix<f64>>, Arc<Mutex<Matrix<f64>>>)=};
+    input data: {=(Arc<Matrix<f64>>, Arc<TransposedMatrix<f64>>)=};
     input doWork: WorkItem;
     output moreWork: {=[WorkItem; 8]=};
+    output sendWork: {=Vec<((usize, usize), f64)>=};
 
     preamble {=
         use crate::reactors::manager::WorkItem;
@@ -181,14 +197,13 @@ reactor Worker(threshold: usize(16384)) {
     =}
 
     reaction (data) {=
-        ctx.use_ref_opt(data, |(a, b, c)| {
+        ctx.use_ref_opt(data, |(a, b)| {
             self.A = a.clone();
             self.B = b.clone();
-            self.C = c.clone();
         });
     =}
 
-    reaction(doWork) -> moreWork {=
+    reaction(doWork) -> moreWork, sendWork {=
         let wi = ctx.get(doWork).unwrap();
 
         // If the number of blocks to process is above the threshold,
@@ -214,17 +229,19 @@ reactor Worker(threshold: usize(16384)) {
             let end_r = wi.srC + wi.dim;
             let end_c = wi.scC + wi.dim;
 
-            let mut c = self.C.lock().unwrap();
+            let mut result = Vec::with_capacity((end_r - wi.srC) * (end_c - wi.scC));
 
             for i in wi.srC..end_r {
                 for j in wi.scC..end_c {
+                    let mut v = 0.0;
                     for k in 0..wi.dim {
-                        let mut v = self.A.get(i, wi.scA + k) * self.B.get(wi.srB + k, j);
-                        v += c.get(i, j);
-                        c.set(i, j, v);
+                        v += self.A.get(i, wi.scA + k) * self.B.get(wi.srB + k, j);
                     }
+                    result.push(((i, j), v));
                 }
             }
+
+            ctx.set(sendWork, result);
         }
     =}
 }
@@ -264,6 +281,7 @@ main reactor (numIterations: usize(12), dataLength: usize(1024), blockThreshold:
     (manager.data)+ -> workers.data;
     manager.doWork -> workers.doWork;
     workers.moreWork -> manager.moreWork;
+    workers.sendWork -> manager.receiveWork;
 
     preamble {=
         use crate::{print_args,reactors::benchmark_runner::{print_system_info, print_benchmark_info}};
